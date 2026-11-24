@@ -2,7 +2,7 @@ import pickle
 from pathlib import Path
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torchvision.transforms import v2
 
 
@@ -37,7 +37,7 @@ def load_trajectories(data_dir: str, img_size: int = 224):
 
 
 class DINOWMDataset(Dataset):
-    def __init__(self, obs_list, act_list, config, frameskip, H):
+    def __init__(self, obs_list, act_list, frameskip, H):
         self.obs_list = obs_list
         self.act_list = act_list
         self.frameskip = frameskip
@@ -61,3 +61,55 @@ class DINOWMDataset(Dataset):
         actions = self.act_list[idx_episode][idx_window:end]
         actions = actions.view(self.H, -1)
         return observations, actions
+
+
+def build_loader(
+    B,
+    config,
+    split,
+    world_size,
+    rank,
+    num_workers,
+    data_dir,
+    img_size=224,
+):
+    split_dir = Path(data_dir) / split
+    target_dir = split_dir if split_dir.exists() else Path(data_dir)
+
+    obs_list, act_list = load_trajectories(str(target_dir), img_size)
+    token_dataset = DINOWMDataset(obs_list, act_list, config.frameskip, config.H)
+
+    is_train = split == "train"
+    sampler = (
+        DistributedSampler(
+            token_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=is_train,
+            drop_last=is_train,
+        )
+        if world_size > 1
+        else None
+    )
+
+    loader = DataLoader(
+        token_dataset,
+        batch_size=B,
+        shuffle=(is_train and sampler is None),
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=is_train,
+        persistent_workers=num_workers > 0,
+    )
+    return loader
+
+
+def infinite_loader(loader):
+    epoch = 0
+    while True:
+        if isinstance(loader.sampler, DistributedSampler):
+            loader.sampler.set_epoch(epoch)
+        for batch in loader:
+            yield batch
+        epoch += 1
